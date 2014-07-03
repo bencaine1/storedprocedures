@@ -1,0 +1,148 @@
+drop procedure ProcessFile;
+go
+use CellTestData2;
+go
+create procedure ProcessFile @file_id int, @cell_assy_uid int, @cycle_type_uid varchar(50)
+as
+
+-- Find last cycle number in CellCycle from this cell assembly, and store it in real_cycle_num.
+declare @real_cycle_num int;
+select top 1 @real_cycle_num = CycleNum from CellCycle
+inner join CellAssembly on CellCycle.CellAssyUID = CellAssembly.CellAssyUID
+where CellAssembly.CellAssyUID = @cell_assy_uid and CellCycle.CycleTypeUID = @cycle_type_uid
+order by CellCycle.CycleNum desc;
+
+-- Find last state from this cell assembly.
+declare @prev_state varchar(50);
+select top 1 @prev_state = CycleStep.state from CycleStep
+inner join CellCycle on CycleStep.cell_cycle_id = CellCycle.CellCycleUID
+inner join CellAssembly on CellCycle.CellAssyUID = CellAssembly.CellAssyUID
+where CellAssembly.CellAssyUID = @cell_assy_uid and CellCycle.CycleTypeUID = @cycle_type_uid and (CycleStep.state = 'D' or CycleStep.state = 'C')
+order by CellCycle.CycleNum desc;
+
+-- Get num_cycles.
+declare @num_cycles int = 1;
+select top 1 @num_cycles = cycle_num from CycleStep
+where file_id = @file_id
+order by CycleStep.cycle_num desc;
+
+-- Go to first legitimate cycle and get the state.
+declare @first_state varchar(50);
+declare @i int = 0;
+while (@i <= @num_cycles)
+begin
+	-- Get start and end times for this cycle
+	declare @start_time Datetime;
+	select top 1 @start_time = dpt_time from CycleStep
+	where file_id = @file_id and cycle_num = @i
+	order by dpt_time asc;
+
+	declare @end_time Datetime;
+	select top 1 @end_time = dpt_time from CycleStep
+	where file_id = @file_id and cycle_num = @i
+	order by dpt_time desc;
+
+	-- cycle is legitimate if it takes over an hour
+	if (datediff(hour, @start_time, @end_time) >= 1)
+	begin
+		select top 1 @first_state = state from CycleStep where file_id = @file_id and cycle_num = @i order by dpt_time asc;
+		if (@first_state = 'C' or @first_state = 'D')
+			break
+	end
+
+	set @i = @i+1;
+end
+
+-- If first state of the new file is different from the last state of the last file (in this cell assy), increment @real_cycle_num.
+-- Basically, check if the cycle is split across files or not.
+if ((@first_state = 'C' and @prev_state = 'D') or (@first_state = 'D' and @prev_state = 'C'))
+	set @real_cycle_num = @real_cycle_num + 1;
+
+-- if @real_cycle_num is null (i.e., this is the first file in this cell assy), set it to 1.
+select @real_cycle_num = isnull(@real_cycle_num, 1);
+
+-- Populate CellCycle table and populate cell_cycle_uid values in CycleStep table.
+-- For each "cycle" in the file:
+set @i = 0;
+while (@i <= @num_cycles)
+begin
+	-- Get start and end times for this cycle
+    select top 1 @start_time = dpt_time from CycleStep
+    where file_id = @file_id and cycle_num = @i
+    order by dpt_time asc;
+
+    select top 1 @end_time = dpt_time from CycleStep
+    where file_id = @file_id and cycle_num = @i
+    order by dpt_time desc;
+
+	-- get last C or D from this cycle
+	declare @last_state_cur varchar(50) = null;
+	select top 1 @last_state_cur = state from CycleStep
+	where file_id = @file_id and cycle_num = @i and (state = 'C' or state = 'D')
+	order by dpt_time desc;
+
+	-- get first C or D from next cycle
+	declare @first_state_next varchar(50) = null;
+	select top 1 @first_state_next = state from CycleStep
+	where file_id = @file_id and cycle_num = @i+1 and (state = 'C' or state = 'D')
+	order by dpt_time asc;
+
+	declare @cc_insert_ok int = 1;
+
+	-- if the cycle is form:
+	if (@cycle_type_uid = 1)
+	begin
+		-- check whether it's form 1 or form 2.
+		declare @form_num tinyint = 1;
+		declare @prev_form_cell_assy int;
+		select top 1 @prev_form_cell_assy = CellAssyUID from CellCycle
+		where CellAssyUID = @cell_assy_uid and CycleTypeUID = 1
+
+		if (@prev_form_cell_assy is not null)
+			set @form_num = 2;
+
+		-- if form2
+		if (@form_num = 2)
+		begin
+			-- get last C end step from the next cycle
+			declare @last_C_ES_next int = null;
+			select top 1 @last_C_ES_next = ES from CycleStep
+			where file_id = @file_id and cycle_num = @i+1 and state = 'C'
+			order by dpt_time desc;
+
+			-- check that it is a 132.
+			if (@last_C_ES_next <> '132')
+				set @cc_insert_ok = 0;
+		end
+	end
+
+	-- if the cycle lasts an hour or more:
+	if (datediff(hour, @start_time, @end_time) >= 1)
+	begin
+		-- if this cycle goes from D to C, or there is no next cycle:
+		if ((@first_state_next is null or (@last_state_cur = 'D' and @first_state_next = 'C')) and (@cc_insert_ok = 1))
+		begin
+			-- insert into CellCycle
+			merge CellCycle as T
+			using (select @cell_assy_uid, @real_cycle_num, @cycle_type_uid) as S (CellAssyUID, CycleNum, CycleTypeUID)
+			on S.CellAssyUID = T.CellAssyUID and S.CycleNum = T.CycleNum and S.CycleTypeUID = T.CycleTypeUID
+			when not matched then insert (CellAssyUID, CycleNum, CycleTypeUID)
+			values (S.CellAssyUID, S.CycleNum, S.CycleTypeUID);
+
+			-- increment real_cycle_num
+			set @real_cycle_num = @real_cycle_num+1;
+		end
+
+		-- get the uid of the last cell cycle inserted
+		declare @cell_cycle_uid int;
+		select top 1 @cell_cycle_uid = CellCycleUID from CellCycle order by CellCycleUID desc;
+
+		-- update CycleStep
+		update CycleStep set cell_cycle_id = @cell_cycle_uid where file_id = @file_id and cycle_num = @i
+	end
+
+	-- increment i
+	set @i = @i+1;
+end
+
+go

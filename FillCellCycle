@@ -1,0 +1,143 @@
+-- This procedure is called for each file.
+-- Populate CellCycle table with correct cycle numbers and CycleStep with correct cell_cycle_uid's.
+drop procedure FillCellCycle;
+go
+use CellTestData2;
+go
+create procedure FillCellCycle @filename varchar(50), @cell_assy_uid int, @cycle_type_name varchar(50)
+as
+
+-- Set RunningStatus to 1.
+update RunningStatus set status = 1;
+
+-- Get FileID for this file.
+declare @file_id int;
+select top 1 @file_id = FileID from Cyclefile where Filename = @filename order by FileID;
+
+-- Get CycleTypeUID for this cycle type.
+declare @cycle_type_uid int;
+select @cycle_type_uid = CycleTypeUID from CycleType where CycleTypeName = @cycle_type_name;
+
+-- Call ProcessFile
+exec ProcessFile @file_id, @cell_assy_uid, @cycle_type_uid;
+
+-- if start of this file is earlier than latest record in the same cell assembly, redo the whole cell assembly.
+-- get start time of this file
+declare @start_dts Datetime;
+select top 1 @start_dts = dpt_time from CycleStep
+where file_id = @file_id
+order by CycleStep.dpt_time asc;
+
+-- get end time of previous file in this cell assembly with the same cycle type
+declare @last_prev_dts Datetime;
+select top 1 @last_prev_dts = dpt_time from CycleStep
+inner join CycleFile on CycleStep.file_id = CycleFile.FileID
+inner join CellCycle on CycleStep.cell_cycle_id = CellCycle.CellCycleUID
+where CycleFile.CellAssyUID = @cell_assy_uid and CellCycle.CycleTypeUID = @cycle_type_uid and CycleStep.file_id <> @file_id
+order by CycleStep.dpt_time desc;
+
+if (@last_prev_dts is not null and datediff(second, @last_prev_dts, @start_dts) < 0)
+begin
+	-- cursor c iterates through all files to redo in correct date order
+	declare @temp_file_id varchar(50);
+	declare c insensitive cursor for
+	select CycleFile.FileID from CellCycle
+	inner join CellAssembly on CellCycle.CellAssyUID = CellAssembly.CellAssyUID
+	inner join CycleFile on CycleFile.CellAssyUID = CellAssembly.CellAssyUID
+	where CycleFile.CellAssyUID = @cell_assy_uid and CellCycle.CycleTypeUID = @cycle_type_uid
+	group by CycleFile.FileID
+	order by max(Cyclefile.TestDate) asc;
+
+	open c;
+
+	fetch next from c into @temp_file_id;
+
+	-- delete the old cell_cycle_id values in CycleStep
+	update CS
+	set CS.cell_cycle_id = null
+	from CycleStep as CS
+	inner join CycleFile as CF on CS.file_id = CF.FileID
+	inner join CellCycle as CC on CS.cell_cycle_id = CC.CellCycleUID
+	where CF.CellAssyUID = @cell_assy_uid and CC.CycleTypeUID = @cycle_type_uid;
+
+	-- delete old cell cycle rows
+	delete from CellCycle where CellAssyUID = @cell_assy_uid and CycleTypeUID = @cycle_type_uid;
+
+	while (@@FETCH_STATUS = 0)
+	begin
+		-- process the file
+		exec ProcessFile @temp_file_id, @cell_assy_uid, @cycle_type_uid;
+
+		-- fetch the next file id
+		fetch next from c into @temp_file_id;
+	end
+
+	-- close and deallocate the cursor
+	close c;
+	deallocate c;
+
+end
+
+-- Set RunningStatus to 0.
+update RunningStatus set status = 0;
+
+/*
+
+-- Populate CellCycle table and populate cell_cycle_uid values in CycleStep table.
+-- For each "cycle" in the file:
+set @i = 0;
+while (@i <= @num_cycles)
+begin
+	-- Get start and end times for this cycle
+    select top 1 @start_time = dpt_time from CycleStep
+    where file_id = @file_id and cycle_num = @i
+    order by dpt_time asc;
+
+    select top 1 @end_time = dpt_time from CycleStep
+    where file_id = @file_id and cycle_num = @i
+    order by dpt_time desc;
+
+	-- get last C or D from this cycle
+	declare @last_state_cur varchar(50) = null;
+	select top 1 @last_state_cur = state from CycleStep
+	where file_id = @file_id and cycle_num = @i and (state = 'C' or state = 'D')
+	order by dpt_time desc;
+
+	-- get first C or D from next cycle
+	declare @first_state_next varchar(50) = null;
+	select top 1 @first_state_next = state from CycleStep
+	where file_id = @file_id and cycle_num = @i+1 and (state = 'C' or state = 'D')
+	order by dpt_time asc;
+
+	-- if the cycle lasts an hour or more:
+	if (datediff(hour, @start_time, @end_time) >= 1)
+	begin
+		-- if this cycle goes from D to C, or there is no next cycle:
+		if (@first_state_next is null or (@last_state_cur = 'D' and @first_state_next = 'C'))
+		begin
+			-- insert into CellCycle
+			merge CellCycle as T
+			using (select @cell_assy_uid, @real_cycle_num, @cycle_type_uid) as S (CellAssyUID, CycleNum, CycleTypeUID)
+			on S.CellAssyUID = T.CellAssyUID and S.CycleNum = T.CycleNum and S.CycleTypeUID = T.CycleTypeUID
+			when not matched then insert (CellAssyUID, CycleNum, CycleTypeUID)
+			values (S.CellAssyUID, S.CycleNum, S.CycleTypeUID);
+		end
+
+		-- get the uid of the last cell cycle inserted
+		declare @cell_cycle_uid int;
+		select top 1 @cell_cycle_uid = CellCycleUID from CellCycle order by CellCycleUID desc;
+
+		-- update CycleStep
+		update CycleStep set cell_cycle_id = @cell_cycle_uid where file_id = @file_id and cycle_num = @i
+
+		-- increment real_cycle_num
+		set @real_cycle_num = @real_cycle_num+1;
+	end
+
+	-- increment i
+	set @i = @i+1;
+end
+go
+*/
+
+go
